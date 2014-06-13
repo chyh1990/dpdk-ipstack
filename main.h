@@ -34,6 +34,13 @@
 #ifndef _MAIN_H_
 #define _MAIN_H_
 
+#include <stdint.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <sys/queue.h>
+#include <linux/ip.h>
+#include <linux/udp.h>
+
 #ifdef RTE_EXEC_ENV_BAREMETAL
 #define MAIN _main
 #else
@@ -41,5 +48,30 @@
 #endif
 
 int MAIN(int argc, char **argv);
+
+#define MAX_UDP_PORTS 65535
+
+typedef int (*udp_callback_fn)(unsigned port, unsigned core,
+	struct rte_mbuf *m, struct udphdr *udphdr);
+
+struct udp_callback{
+	TAILQ_ENTRY(udp_callback) entries;
+	udp_callback_fn cb;
+	void *private_data;
+};
+
+struct streamfilter_ctx{
+	TAILQ_HEAD(_udp_cb_head, udp_callback) udp_cb_head[MAX_UDP_PORTS+1];
+};
+
+struct streamfilter_ctx *sf_init_context(void);
+void sf_destroy_context(void);
+
+int sf_register_udp_callback(unsigned port, udp_callback_fn fn, void *data);
+
+/* global ctx
+ * Assume immutable in mainloop
+ */
+extern struct streamfilter_ctx *__sf_ctx; /* numa/cache ? */
 
 #endif /* _MAIN_H_ */

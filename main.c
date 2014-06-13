@@ -70,51 +70,19 @@
 #include <rte_mempool.h>
 #include <rte_mbuf.h>
 
+#include "config.h"
 #include "main.h"
+#include "util.h"
 #include "arp.h"
 #include <linux/icmp.h>
 #include <linux/ip.h>
-
-//#define DPRINTF(fmt, ...)
-
-#ifndef DPRINTF
-#define DPRINTF(fmt, ...) fprintf(stderr, "[CPU %d] " fmt, rte_lcore_id(), ##__VA_ARGS__)
-#endif
-
-
+#include <linux/udp.h>
 
 #define RTE_LOGTYPE_L2FWD RTE_LOGTYPE_USER1
 
 #define MBUF_SIZE (2048 + sizeof(struct rte_mbuf) + RTE_PKTMBUF_HEADROOM)
 #define NB_MBUF   8192
 
-/*
- * RX and TX Prefetch, Host, and Write-back threshold values should be
- * carefully set for optimal performance. Consult the network
- * controller's datasheet and supporting DPDK documentation for guidance
- * on how these parameters should be set.
- */
-#define RX_PTHRESH 8 /**< Default values of RX prefetch threshold reg. */
-#define RX_HTHRESH 8 /**< Default values of RX host threshold reg. */
-#define RX_WTHRESH 4 /**< Default values of RX write-back threshold reg. */
-
-/*
- * These default values are optimized for use with the Intel(R) 82599 10 GbE
- * Controller and the DPDK ixgbe PMD. Consider using other values for other
- * network controllers and/or network drivers.
- */
-#define TX_PTHRESH 36 /**< Default values of TX prefetch threshold reg. */
-#define TX_HTHRESH 0  /**< Default values of TX host threshold reg. */
-#define TX_WTHRESH 0  /**< Default values of TX write-back threshold reg. */
-
-#define MAX_PKT_BURST 32
-#define BURST_TX_DRAIN_US 100 /* TX drain every ~100us */
-
-/*
- * Configurable number of RX/TX ring descriptors
- */
-#define RTE_TEST_RX_DESC_DEFAULT 128
-#define RTE_TEST_TX_DESC_DEFAULT 512
 static uint16_t nb_rxd = RTE_TEST_RX_DESC_DEFAULT;
 static uint16_t nb_txd = RTE_TEST_TX_DESC_DEFAULT;
 
@@ -191,7 +159,9 @@ static const struct rte_eth_txconf tx_conf = {
 	* set the flag by default.
 	*/
 	.txq_flags = ETH_TXQ_FLAGS_NOMULTSEGS
+#ifdef SOFTWARE_CHECKSUM
 		| ETH_TXQ_FLAGS_NOOFFLOADS,
+#endif
 };
 
 struct rte_mempool * l2fwd_pktmbuf_pool = NULL;
@@ -273,6 +243,19 @@ print_stats(void)
 	printf("\n====================================================\n");
 }
 
+static inline void print_mac_addr(unsigned portid){
+		fprintf(stderr, "Port %u, MAC address: %02X:%02X:%02X:%02X:%02X:%02X\n\n",
+				(unsigned) portid,
+				l2fwd_ports_eth_addr[portid].addr_bytes[0],
+				l2fwd_ports_eth_addr[portid].addr_bytes[1],
+				l2fwd_ports_eth_addr[portid].addr_bytes[2],
+				l2fwd_ports_eth_addr[portid].addr_bytes[3],
+				l2fwd_ports_eth_addr[portid].addr_bytes[4],
+				l2fwd_ports_eth_addr[portid].addr_bytes[5]);
+
+}
+
+
 /* Send the burst of packets on an output interface */
 static int
 l2fwd_send_burst(struct lcore_queue_conf *qconf, unsigned n, uint8_t port)
@@ -320,40 +303,13 @@ l2fwd_send_packet(struct rte_mbuf *m, uint8_t port)
 }
 
 static void
-l2fwd_simple_forward(struct rte_mbuf *m, unsigned portid)
+l2fwd_drop_packet(struct rte_mbuf *m)
 {
-	struct ether_hdr *eth;
-	void *tmp;
-	unsigned dst_port;
-
-	dst_port = l2fwd_dst_ports[portid];
-	eth = rte_pktmbuf_mtod(m, struct ether_hdr *);
-
-	/* 02:00:00:00:00:xx */
-	tmp = &eth->d_addr.addr_bytes[0];
-	*((uint64_t *)tmp) = 0x000000000002 + ((uint64_t)dst_port << 40);
-
-	/* src addr */
-	ether_addr_copy(&l2fwd_ports_eth_addr[dst_port], &eth->s_addr);
-
-	l2fwd_send_packet(m, (uint8_t) dst_port);
+	rte_pktmbuf_free(m);
 }
-
-static inline void print_mac_addr(unsigned portid){
-		DPRINTF("Port %u, MAC address: %02X:%02X:%02X:%02X:%02X:%02X\n\n",
-				(unsigned) portid,
-				l2fwd_ports_eth_addr[portid].addr_bytes[0],
-				l2fwd_ports_eth_addr[portid].addr_bytes[1],
-				l2fwd_ports_eth_addr[portid].addr_bytes[2],
-				l2fwd_ports_eth_addr[portid].addr_bytes[3],
-				l2fwd_ports_eth_addr[portid].addr_bytes[4],
-				l2fwd_ports_eth_addr[portid].addr_bytes[5]);
-
-}
-
 
 static pthread_mutex_t dump_mutex=PTHREAD_MUTEX_INITIALIZER; 
-static void
+static inline  void
 dump_packet(struct rte_mbuf *m, unsigned core_id) {
 	pthread_mutex_lock(&dump_mutex);
 	DPRINTF("Dump from core %d\n", core_id);
@@ -362,7 +318,6 @@ dump_packet(struct rte_mbuf *m, unsigned core_id) {
 	
 }
 
-#define NIC_IP_ADDR 0x0100000a
 static int arp_input_reply(struct rte_mbuf *m, unsigned portid)
 {
 	/* reuse buffer */
@@ -380,7 +335,7 @@ static int arp_input_reply(struct rte_mbuf *m, unsigned portid)
 	arph->ar_op = htons(arp_op_reply);
 
 	arph->ar_tip = arph->ar_sip;
-	DPRINTF("XXX %08x\n", arph->ar_sip);
+	//DPRINTF("XXX %08x\n", arph->ar_sip);
 	print_mac_addr(portid);
 	arph->ar_sip = NIC_IP_ADDR;
 
@@ -395,89 +350,37 @@ static int arp_input_reply(struct rte_mbuf *m, unsigned portid)
 
 static inline int arp_input(struct rte_mbuf *m, unsigned portid)
 {
-	struct arphdr *arph = (struct arphdr *)(rte_pktmbuf_mtod(m, unsigned char*) + sizeof(struct ether_hdr));
+	struct arphdr *arph = (struct arphdr *)(rte_pktmbuf_mtod(m, struct ether_hdr*) + 1);
 	int to_me = 0;
 	if(arph->ar_tip == NIC_IP_ADDR)
 		to_me = 1;
-	if(!to_me)
+	if(!to_me){
+		l2fwd_drop_packet(m);
 		return 0;
+	}
 
 	switch (ntohs(arph->ar_op)){
 		case arp_op_request:
 			arp_input_reply(m, portid);
 			break;
 		default:
+			l2fwd_drop_packet(m);
 			break;
 	}
 	return 0;
 }
 
-static unsigned short cksum(void *_buf, int size)
-{
-	unsigned short *buffer = _buf;
-	unsigned long cksum=0;
-	while(size >1)
-	{
-		cksum+=*buffer++;
-		size -=sizeof(unsigned short);
-	}
-	if(size)
-		cksum += *(unsigned char*)buffer;
 
-	cksum = (cksum >> 16) + (cksum & 0xffff);
-	cksum += (cksum >>16);
-	return (unsigned short)(~cksum);
-}
-
-static inline __sum16 ip_fast_csum(const void *iph, unsigned int ihl)
-{
-	unsigned int sum;
-
-	asm("  movl (%1), %0\n"
-	    "  subl $4, %2\n"
-	    "  jbe 2f\n"
-	    "  addl 4(%1), %0\n"
-	    "  adcl 8(%1), %0\n"
-	    "  adcl 12(%1), %0\n"
-	    "1: adcl 16(%1), %0\n"
-	    "  lea 4(%1), %1\n"
-	    "  decl %2\n"
-	    "  jne      1b\n"
-	    "  adcl $0, %0\n"
-	    "  movl %0, %2\n"
-	    "  shrl $16, %0\n"
-	    "  addw %w2, %w0\n"
-	    "  adcl $0, %0\n"
-	    "  notl %0\n"
-	    "2:"
-	    /* Since the input registers which are loaded with iph and ih
-	       are modified, we must also specify them as outputs, or gcc
-	       will assume they contain their original values. */
-	    : "=r" (sum), "=r" (iph), "=r" (ihl)
-	    : "1" (iph), "2" (ihl)
-	       : "memory");
-	return (__sum16)sum;
-}
-
-
-static inline void ip4_swap_addr(struct iphdr *hdr)
-{
-	uint32_t t = hdr->saddr;
-	hdr->saddr = hdr->daddr;
-	hdr->daddr = t;
-}
-
-static inline void ether_swap_mac(struct ether_hdr *hdr){
-	struct ether_addr t;
-	ether_addr_copy(&hdr->s_addr, &t);
-	ether_addr_copy(&hdr->d_addr, &hdr->s_addr);
-	ether_addr_copy(&t, &hdr->d_addr);
-}
 
 static inline int eth_output_fast(struct rte_mbuf *m, unsigned portid)
 {
 	struct ether_hdr *eth = rte_pktmbuf_mtod(m, struct ether_hdr *);
 	ether_swap_mac(eth);
+
+#ifndef SOFTWARE_CHECKSUM
+	m->pkt.vlan_macip.f.l2_len = sizeof(struct ether_hdr);
+	m->ol_flags |= PKT_TX_IP_CKSUM;
+#endif
 
 	l2fwd_send_packet(m, portid);
 	return 0;
@@ -496,14 +399,20 @@ static inline int ip4_output_fast(struct rte_mbuf *m, unsigned portid)
 	//iph->frag_off = 0;	// no fragmentation
 	iph->tos = 0;
 	iph->check = 0;
+
+#ifdef SOFTWARE_CHECKSUM
 	iph->check = ip_fast_csum(iph, iph->ihl);
+#else
+	//XXX lenght
+	m->pkt.vlan_macip.f.l3_len = sizeof(struct iphdr);
+#endif
 
 	return eth_output_fast(m, portid);	
 }
 
 static inline int icmp_input(struct rte_mbuf *m, unsigned portid)
 {
-	struct iphdr* iph = (struct iphdr *)(rte_pktmbuf_mtod(m, unsigned char*) + sizeof(struct ether_hdr));
+	struct iphdr* iph = (struct iphdr *)(rte_pktmbuf_mtod(m, struct ether_hdr*) + 1);
 	int ip_len = ntohs(iph->tot_len);
 	int ip_hdr_len = iph->ihl << 2;
 	int icmp_len = ip_len - ip_hdr_len;
@@ -513,10 +422,12 @@ static inline int icmp_input(struct rte_mbuf *m, unsigned portid)
 	//DPRINTF("icmp len %d, type %d\n", icmp_len, icmp->type);
 	if(cksum(icmp, icmp_len)){
 		DPRINTF("icmp checksum error\n");
+		l2fwd_drop_packet(m);
 		return -EINVAL;
 	}
 	if(icmp->type != ICMP_ECHO || icmp->code != 0){
 		DPRINTF("icmp unsupport error %d, %d\n", icmp->type, icmp->code);
+		l2fwd_drop_packet(m);
 		return 0;
 	}
 
@@ -527,12 +438,40 @@ static inline int icmp_input(struct rte_mbuf *m, unsigned portid)
 	return ip4_output_fast(m, portid);
 }
 
+static inline int udp4_input(struct rte_mbuf *m, unsigned portid)
+{
+	struct iphdr* iph = (struct iphdr *)(rte_pktmbuf_mtod(m, struct ether_hdr*) + 1);
+	int ip_len = ntohs(iph->tot_len);
+	int ip_hdr_len = iph->ihl << 2;
+	int ret;
+	struct udphdr *udp = (struct udphdr*)((unsigned char*)iph + ip_hdr_len);
+	struct udp_callback *cb;
+
+	int udp_len = ip_len - ip_hdr_len;
+	if(udp_len < (int)sizeof(struct udphdr))
+		return -EINVAL;
+
+	/* TODO udp checksum optional */
+	unsigned short dst_port = ntohs(udp->dest);
+	if (TAILQ_EMPTY(&__sf_ctx->udp_cb_head[dst_port]))
+		l2fwd_drop_packet(m);
+
+	TAILQ_FOREACH(cb, &__sf_ctx->udp_cb_head[dst_port], entries) {
+		ret = cb->cb(portid, rte_lcore_id(), m, udp);
+	}
+	return 0;
+}
+
 static inline int ip4_input(struct rte_mbuf *m, unsigned portid)
 {
 	struct iphdr* iph = (struct iphdr *)(rte_pktmbuf_mtod(m, unsigned char*) + sizeof(struct ether_hdr));
 	uint16_t ip_len = ntohs(iph->tot_len);
 	if (ip_len < sizeof(struct iphdr))
 		return -EINVAL;
+	if (iph->version != 0x4 ) {
+		/* drop */
+		return 0;
+	}
 #ifdef SOFTWARE_CHECKSUM
 	NOT_IMPLEMENTED;
 #endif
@@ -540,18 +479,16 @@ static inline int ip4_input(struct rte_mbuf *m, unsigned portid)
 	if(iph->daddr != NIC_IP_ADDR)
 		return 0;
 #endif
-	if (iph->version != 0x4 ) {
-		/* drop */
-		return 0;
-	}
 	switch (iph->protocol) {
-		case IPPROTO_TCP:
-			break;
 		case IPPROTO_UDP:
+			udp4_input(m, portid);
 			break;
 		case IPPROTO_ICMP:
 			icmp_input(m, portid);
 			break;
+		case IPPROTO_TCP:
+		default:
+			l2fwd_drop_packet(m);
 	}
 	return 0;
 }
@@ -569,6 +506,7 @@ static inline void l2dispatch(struct rte_mbuf *m, unsigned portid)
 		arp_input(m, portid);
 	} else {
 		/* drop */
+		l2fwd_drop_packet(m);
 	}
 }
 
@@ -578,10 +516,9 @@ static inline void l2dispatch(struct rte_mbuf *m, unsigned portid)
 l2fwd_main_loop(void)
 {
 	struct rte_mbuf *pkts_burst[MAX_PKT_BURST];
-	struct rte_mbuf *m;
-	unsigned lcore_id;
+	unsigned lcore_id, portid;
 	uint64_t prev_tsc, diff_tsc, cur_tsc, timer_tsc;
-	unsigned i, j, portid, nb_rx;
+	int i, j, nb_rx;
 	struct lcore_queue_conf *qconf;
 	const uint64_t drain_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S * BURST_TX_DRAIN_US;
 
@@ -598,7 +535,7 @@ l2fwd_main_loop(void)
 
 	RTE_LOG(INFO, L2FWD, "entering main loop on lcore %u, n_rx_port %d, queue_id %d\n", lcore_id, qconf->n_rx_port, qconf->queue_id);
 
-	for (i = 0; i < qconf->n_rx_port; i++) {
+	for (i = 0; i < (int)qconf->n_rx_port; i++) {
 		portid = qconf->rx_port_list[i];
 		RTE_LOG(INFO, L2FWD, " -- lcoreid=%u portid=%u\n", lcore_id,
 				portid);
@@ -647,8 +584,8 @@ l2fwd_main_loop(void)
 		/*
 		 * Read packet from RX queues
 		 */
-		for (i = 0; i < qconf->n_rx_port; i++) {
-
+		for (i = 0; i < (int)qconf->n_rx_port; i++) {
+			//int j;
 			portid = qconf->rx_port_list[i];
 			nb_rx = rte_eth_rx_burst((uint8_t) portid, qconf->queue_id,
 					pkts_burst, MAX_PKT_BURST);
@@ -656,13 +593,24 @@ l2fwd_main_loop(void)
 			//port_statistics[portid].rx += nb_rx;
 			port_statistics[portid].percore[lcore_id].rx += nb_rx;
 
-			for (j = 0; j < nb_rx; j++) {
-				m = pkts_burst[j];
-				rte_prefetch0(rte_pktmbuf_mtod(m, void *));
-				l2dispatch(m, portid);
-				//l2fwd_simple_forward(m, portid);
-				//dump_packet(m, lcore_id);
+			/* Prefetch first packets */
+			for (j = 0; j < PREFETCH_OFFSET && j < nb_rx; j++) {
+				rte_prefetch0(rte_pktmbuf_mtod(
+							pkts_burst[j], void *));
 			}
+
+			/* Prefetch and forward already prefetched packets */
+			for (j = 0; j < (nb_rx - PREFETCH_OFFSET); j++) {
+				rte_prefetch0(rte_pktmbuf_mtod(pkts_burst[
+							j + PREFETCH_OFFSET], void *));
+				l2dispatch(pkts_burst[j], portid);
+			}
+
+			/* Forward remaining prefetched packets */
+			for (; j < nb_rx; j++) {
+				l2dispatch(pkts_burst[j], portid);
+			}
+
 		}
 	}
 }
@@ -858,8 +806,8 @@ check_all_ports_link_status(uint8_t port_num, uint32_t port_mask)
 	}
 }
 
-	int
-MAIN(int argc, char **argv)
+static int
+nic_main(int argc, char **argv)
 {
 	struct lcore_queue_conf *qconf;
 	struct rte_eth_dev_info dev_info;
@@ -999,14 +947,7 @@ MAIN(int argc, char **argv)
 		rte_eth_promiscuous_enable(portid);
 #endif
 
-		DPRINTF("Port %u, MAC address: %02X:%02X:%02X:%02X:%02X:%02X\n\n",
-				(unsigned) portid,
-				l2fwd_ports_eth_addr[portid].addr_bytes[0],
-				l2fwd_ports_eth_addr[portid].addr_bytes[1],
-				l2fwd_ports_eth_addr[portid].addr_bytes[2],
-				l2fwd_ports_eth_addr[portid].addr_bytes[3],
-				l2fwd_ports_eth_addr[portid].addr_bytes[4],
-				l2fwd_ports_eth_addr[portid].addr_bytes[5]);
+		print_mac_addr(portid);
 
 		/* initialize port stats */
 		memset(&port_statistics, 0, sizeof(port_statistics));
@@ -1048,5 +989,46 @@ MAIN(int argc, char **argv)
 	}
 
 	return 0;
+}
+
+struct streamfilter_ctx *__sf_ctx = NULL;
+struct streamfilter_ctx *sf_init_context(void)
+{
+	if(__sf_ctx)
+		return __sf_ctx;
+	struct streamfilter_ctx *ctx = malloc(sizeof(struct streamfilter_ctx));
+	int i;
+	for(i=0; i < MAX_UDP_PORTS+1; i++){
+		TAILQ_INIT(&ctx->udp_cb_head[i]);
+	}
+	__sf_ctx = ctx;
+	return ctx;
+}
+
+void sf_destroy_context(void)
+{
+	//TODO free all callback
+	free(__sf_ctx);
+}
+
+int sf_register_udp_callback(unsigned port, udp_callback_fn fn, void *data)
+{
+	if(port > MAX_UDP_PORTS)
+		return -EINVAL;
+	struct udp_callback *cb = malloc(sizeof(struct udp_callback));
+	cb->cb = fn;
+	cb->private_data = data;
+	TAILQ_INSERT_TAIL(&__sf_ctx->udp_cb_head[port], cb, entries);
+	return 0;
+}
+
+int main(int argc, char **argv)
+{
+	sf_init_context();
+
+	int ret = nic_main(argc, argv);
+
+	sf_destroy_context();
+	return ret;
 }
 
