@@ -171,6 +171,8 @@ struct rte_mempool * l2fwd_pktmbuf_pool = NULL;
 struct percore_statistics {
 	uint64_t tx;
 	uint64_t rx;
+	uint64_t dropped;
+	int nb_rx_burst;
 } __rte_cache_aligned;
 
 /* Per-port statistics struct */
@@ -178,7 +180,7 @@ struct l2fwd_port_statistics {
 	uint64_t tx;
 	uint64_t rx;
 	uint64_t dropped;
-	struct percore_statistics percore[RTE_MAX_LCORE] __rte_cache_aligned;
+	struct percore_statistics percore[RTE_MAX_LCORE] ;
 } __rte_cache_aligned;
 struct l2fwd_port_statistics port_statistics[RTE_MAX_ETHPORTS];
 
@@ -187,6 +189,11 @@ struct l2fwd_port_statistics port_statistics[RTE_MAX_ETHPORTS];
 #define MAX_TIMER_PERIOD 86400 /* 1 day max */
 static int64_t timer_period = 10 * TIMER_MILLISECOND * 1000; /* default period is 10 seconds */
 
+static inline double gettime_sec(){
+	struct timeval	tv;
+	gettimeofday(&tv);
+	return tv.tv_sec - tv.tv_usec * 1e-6;
+}
 /* Print out statistics on packets dropped */
 static void
 print_stats(void)
@@ -201,18 +208,28 @@ print_stats(void)
 	const char clr[] = { 27, '[', '2', 'J', '\0' };
 	const char topLeft[] = { 27, '[', '1', ';', '1', 'H','\0' };
 	int nb_lcores = rte_lcore_count();
+	static double last_time = 0;
+	double cur_time = gettime_sec();
+	double time_diff = cur_time - last_time;
+	static uint64_t last_total_rx = 0;
+	last_time = cur_time;
 
 		/* Clear screen and move to top left */
 	printf("%s%s", clr, topLeft);
 
-	printf("\nPort statistics ====================================");
+	printf("\nPort statistics %lf ====================================", time_diff);
 
 	for (portid = 0; portid < RTE_MAX_ETHPORTS; portid++) {
 		int c;
-		uint64_t s = 0;
-		for(c = 0; c < nb_lcores; c++)
-			s += port_statistics[portid].percore[c].rx;
-		port_statistics[portid].rx = s;
+		uint64_t rx = 0, tx = 0, dropped = 0;
+		for(c = 0; c < nb_lcores; c++){
+			rx += port_statistics[portid].percore[c].rx;
+			tx += port_statistics[portid].percore[c].tx;
+			dropped += port_statistics[portid].percore[c].dropped;
+		}
+		port_statistics[portid].rx = rx;
+		port_statistics[portid].tx = tx;
+		port_statistics[portid].dropped = dropped;
 	}
 	for (portid = 0; portid < RTE_MAX_ETHPORTS; portid++) {
 		int c;
@@ -229,7 +246,11 @@ print_stats(void)
 			   port_statistics[portid].dropped);
 		
 		for(c = 0; c < nb_lcores; c++)
-			printf("\n\t core %d: rx\t%20"PRIu64, c, port_statistics[portid].percore[c].rx);
+			printf("\n\t core %d: rx: %8"PRIu64" tx: %8"PRIu64" drop: %8"PRIu64" rx_burst: %d", c, 
+					port_statistics[portid].percore[c].rx,
+					port_statistics[portid].percore[c].tx,
+					port_statistics[portid].percore[c].dropped,
+					port_statistics[portid].percore[c].nb_rx_burst);
 
 		total_packets_dropped += port_statistics[portid].dropped;
 		total_packets_tx += port_statistics[portid].tx;
@@ -237,12 +258,14 @@ print_stats(void)
 	}
 	printf("\nAggregate statistics ==============================="
 		   "\nTotal packets sent: %18"PRIu64
-		   "\nTotal packets received: %14"PRIu64
+		   "\nTotal packets received: %14"PRIu64", %lf pps"
 		   "\nTotal packets dropped: %15"PRIu64,
 		   total_packets_tx,
 		   total_packets_rx,
+		   (total_packets_rx - last_total_rx) / time_diff,
 		   total_packets_dropped);
 	printf("\n====================================================\n");
+	last_total_rx = total_packets_tx;
 }
 
 static inline void print_mac_addr(unsigned portid){
@@ -264,14 +287,19 @@ l2fwd_send_burst(struct lcore_queue_conf *qconf, unsigned n, uint8_t port)
 {
 	struct rte_mbuf **m_table;
 	unsigned ret;
-	unsigned queueid =0;
+	unsigned queueid = qconf->queue_id;
+	int lcore = rte_lcore_id();
 
 	m_table = (struct rte_mbuf **)qconf->tx_mbufs[port].m_table;
 
 	ret = rte_eth_tx_burst(port, (uint16_t) queueid, m_table, (uint16_t) n);
-	port_statistics[port].tx += ret;
+	if(ret > MAX_PKT_BURST){
+		DPRINTF( "ret %d %d\n", ret, n);
+	}
+
+	port_statistics[port].percore[lcore].tx += ret;
 	if (unlikely(ret < n)) {
-		port_statistics[port].dropped += (n - ret);
+		port_statistics[port].percore[lcore].dropped += (n - ret);
 		do {
 			rte_pktmbuf_free(m_table[ret]);
 		} while (++ret < n);
@@ -419,6 +447,17 @@ static inline int ip4_output_fast(struct rte_mbuf *m, unsigned portid)
 #endif
 
 	return eth_output_fast(m, portid);	
+}
+
+static inline int udp4_output_fast(struct rte_mbuf *m, struct udphdr *udphdr, 
+		unsigned portid)
+{
+	unsigned short t = udphdr->dest;
+	udphdr->dest = udphdr->source;
+	udphdr->source = t;
+	/* optional checksum */
+	udphdr->check = 0;
+	return ip4_output_fast(m, portid);
 }
 
 static inline int icmp_input(struct rte_mbuf *m, unsigned portid)
@@ -619,6 +658,8 @@ l2fwd_main_loop(void)
 
 			//port_statistics[portid].rx += nb_rx;
 			port_statistics[portid].percore[lcore_id].rx += nb_rx;
+			if(nb_rx)
+				port_statistics[portid].percore[lcore_id].nb_rx_burst = nb_rx;
 
 			/* Prefetch first packets */
 			for (j = 0; j < PREFETCH_OFFSET && j < nb_rx; j++) {
@@ -1051,10 +1092,12 @@ int sf_register_udp_callback(unsigned port, udp_callback_fn fn, void *data)
 	return 0;
 }
 
-int udp_callback_echo(unsigned port, unsigned core,
+static int udp_callback_echo(unsigned port, unsigned core,
 	struct rte_mbuf *m, struct udphdr *udphdr)
 {
-	return SF_ACCEPT;	
+	(void)core;
+	udp4_output_fast(m, udphdr, port);
+	return SF_STOLEN;	
 }
 
 int main(int argc, char **argv)
