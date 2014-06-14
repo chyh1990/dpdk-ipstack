@@ -51,6 +51,12 @@ int MAIN(int argc, char **argv);
 
 #define MAX_UDP_PORTS 65535
 
+#define SF_DROP 0
+#define SF_ACCEPT 1
+#define SF_STOLEN 2
+#define SF_QUEUE 3
+#define SF_REPEAT 4
+
 typedef int (*udp_callback_fn)(unsigned port, unsigned core,
 	struct rte_mbuf *m, struct udphdr *udphdr);
 

@@ -109,6 +109,8 @@ struct lcore_queue_conf {
 	unsigned rx_port_list[MAX_RX_QUEUE_PER_LCORE];
 	unsigned queue_id;
 	struct mbuf_table tx_mbufs[RTE_MAX_ETHPORTS];
+	unsigned int next_ip_id;
+	unsigned int ip_id_step;
 
 } __rte_cache_aligned;
 struct lcore_queue_conf lcore_queue_conf[RTE_MAX_LCORE];
@@ -386,6 +388,14 @@ static inline int eth_output_fast(struct rte_mbuf *m, unsigned portid)
 	return 0;
 }
 
+static inline unsigned int ip4_next_id(void)
+{
+	int core = rte_lcore_id();
+	struct lcore_queue_conf *qconf = &lcore_queue_conf[core];
+	unsigned int r = qconf->next_ip_id;
+	qconf->next_ip_id += core;
+	return r;
+}
 
 static inline int ip4_output_fast(struct rte_mbuf *m, unsigned portid)
 {
@@ -399,6 +409,7 @@ static inline int ip4_output_fast(struct rte_mbuf *m, unsigned portid)
 	//iph->frag_off = 0;	// no fragmentation
 	iph->tos = 0;
 	iph->check = 0;
+	iph->id = ip4_next_id();
 
 #ifdef SOFTWARE_CHECKSUM
 	iph->check = ip_fast_csum(iph, iph->ihl);
@@ -453,12 +464,28 @@ static inline int udp4_input(struct rte_mbuf *m, unsigned portid)
 
 	/* TODO udp checksum optional */
 	unsigned short dst_port = ntohs(udp->dest);
-	if (TAILQ_EMPTY(&__sf_ctx->udp_cb_head[dst_port]))
+	if (TAILQ_EMPTY(&__sf_ctx->udp_cb_head[dst_port])){
 		l2fwd_drop_packet(m);
+		goto done;
+	}
 
 	TAILQ_FOREACH(cb, &__sf_ctx->udp_cb_head[dst_port], entries) {
+again:
 		ret = cb->cb(portid, rte_lcore_id(), m, udp);
+		switch(ret){
+			case SF_DROP:
+				l2fwd_drop_packet(m);
+				goto done;
+			case SF_STOLEN:
+				goto done;
+			case SF_REPEAT:
+				goto again;
+			case SF_ACCEPT:
+			default:
+				break;
+		}
 	}
+done:
 	return 0;
 }
 
@@ -975,6 +1002,8 @@ nic_main(int argc, char **argv)
 		qconf->rx_port_list[qconf->n_rx_port] = portid;
 		qconf->n_rx_port++;
 		qconf->queue_id = i;
+		qconf->ip_id_step = rte_lcore_count();
+		qconf->next_ip_id = i;
 		printf("Lcore %u: RX port %u\n", rx_lcore_id, (unsigned) portid);
 		rx_lcore_id++;
 	}
@@ -1022,9 +1051,17 @@ int sf_register_udp_callback(unsigned port, udp_callback_fn fn, void *data)
 	return 0;
 }
 
+int udp_callback_echo(unsigned port, unsigned core,
+	struct rte_mbuf *m, struct udphdr *udphdr)
+{
+	return SF_ACCEPT;	
+}
+
 int main(int argc, char **argv)
 {
 	sf_init_context();
+
+	sf_register_udp_callback(5555, udp_callback_echo, NULL);
 
 	int ret = nic_main(argc, argv);
 
