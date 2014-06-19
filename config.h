@@ -30,10 +30,17 @@
 #define RTE_TEST_RX_DESC_DEFAULT 128
 #define RTE_TEST_TX_DESC_DEFAULT 512
 
+#define MAX_RX_QUEUE_PER_LCORE 16
+#define MAX_TX_QUEUE_PER_PORT 16
 
+/* A tsc-based timer responsible for triggering statistics printout */
+#define TIMER_MILLISECOND 2000000ULL /* around 1ms at 2 Ghz */
+#define MAX_TIMER_PERIOD 86400 /* 1 day max */
 //#define USE_PROMISCUOUS_MODE
 //#define SOFTWARE_CHECKSUM
 
 #define NIC_IP_ADDR 0x0100000a
+
+#define MAX_NUM_CORE 64
 
 #endif

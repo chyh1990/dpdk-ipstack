@@ -1,36 +1,4 @@
-/*-
- *   BSD LICENSE
- * 
- *   Copyright(c) 2010-2014 Intel Corporation. All rights reserved.
- *   All rights reserved.
- * 
- *   Redistribution and use in source and binary forms, with or without
- *   modification, are permitted provided that the following conditions
- *   are met:
- * 
- *     * Redistributions of source code must retain the above copyright
- *       notice, this list of conditions and the following disclaimer.
- *     * Redistributions in binary form must reproduce the above copyright
- *       notice, this list of conditions and the following disclaimer in
- *       the documentation and/or other materials provided with the
- *       distribution.
- *     * Neither the name of Intel Corporation nor the names of its
- *       contributors may be used to endorse or promote products derived
- *       from this software without specific prior written permission.
- * 
- *   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
- *   "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
- *   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
- *   A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
- *   OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- *   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- *   LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- *   DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- *   THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- *   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-
+/* Yuheng Chen (chyh1990@gmail.com) 2014/6 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,16 +6,19 @@
 #include <inttypes.h>
 #include <sys/types.h>
 #include <sys/queue.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <setjmp.h>
 #include <stdarg.h>
 #include <ctype.h>
 #include <errno.h>
 #include <getopt.h>
+#include <assert.h>
 
 #include <rte_common.h>
 #include <rte_log.h>
 #include <rte_memory.h>
+#include <rte_malloc.h>
 #include <rte_memcpy.h>
 #include <rte_memzone.h>
 #include <rte_tailq.h>
@@ -72,6 +43,7 @@
 
 #include "config.h"
 #include "main.h"
+#include "mp_common.h"
 #include "util.h"
 #include "arp.h"
 #include <linux/icmp.h>
@@ -83,27 +55,27 @@
 #define MBUF_SIZE (2048 + sizeof(struct rte_mbuf) + RTE_PKTMBUF_HEADROOM)
 #define NB_MBUF   8192
 
+#define NB_CONTROLBUF   (64*MAX_CLIENTS)
+
 static uint16_t nb_rxd = RTE_TEST_RX_DESC_DEFAULT;
 static uint16_t nb_txd = RTE_TEST_TX_DESC_DEFAULT;
 
 /* ethernet addresses of ports */
-static struct ether_addr l2fwd_ports_eth_addr[RTE_MAX_ETHPORTS];
+static struct ether_addr ups_ports_eth_addr[RTE_MAX_ETHPORTS];
 
 /* mask of enabled ports */
-static uint32_t l2fwd_enabled_port_mask = 0;
+extern uint32_t ups_enabled_port_mask;
+extern unsigned int ups_rx_queue_per_lcore;
 
 /* list of enabled ports */
-static uint32_t l2fwd_dst_ports[RTE_MAX_ETHPORTS];
+static uint32_t ups_dst_ports[RTE_MAX_ETHPORTS];
 
-static unsigned int l2fwd_rx_queue_per_lcore = 1;
 
 struct mbuf_table {
 	unsigned len;
 	struct rte_mbuf *m_table[MAX_PKT_BURST];
 };
 
-#define MAX_RX_QUEUE_PER_LCORE 16
-#define MAX_TX_QUEUE_PER_PORT 16
 struct lcore_queue_conf {
 	unsigned n_rx_port;
 	unsigned rx_port_list[MAX_RX_QUEUE_PER_LCORE];
@@ -112,6 +84,8 @@ struct lcore_queue_conf {
 	unsigned int next_ip_id;
 	unsigned int ip_id_step;
 
+	//XXX multi client per queue
+	struct client *client;
 } __rte_cache_aligned;
 struct lcore_queue_conf lcore_queue_conf[RTE_MAX_LCORE];
 
@@ -166,7 +140,11 @@ static const struct rte_eth_txconf tx_conf = {
 #endif
 };
 
-struct rte_mempool * l2fwd_pktmbuf_pool = NULL;
+struct client *clients;
+const unsigned int num_clients = MAX_CLIENTS;
+
+struct rte_mempool * ups_pktmbuf_pool = NULL;
+struct rte_mempool * ups_ctl_pool = NULL;
 
 struct percore_statistics {
 	uint64_t tx;
@@ -176,22 +154,19 @@ struct percore_statistics {
 } __rte_cache_aligned;
 
 /* Per-port statistics struct */
-struct l2fwd_port_statistics {
+struct ups_port_statistics {
 	uint64_t tx;
 	uint64_t rx;
 	uint64_t dropped;
 	struct percore_statistics percore[RTE_MAX_LCORE] ;
 } __rte_cache_aligned;
-struct l2fwd_port_statistics port_statistics[RTE_MAX_ETHPORTS];
+struct ups_port_statistics port_statistics[RTE_MAX_ETHPORTS];
 
-/* A tsc-based timer responsible for triggering statistics printout */
-#define TIMER_MILLISECOND 2000000ULL /* around 1ms at 2 Ghz */
-#define MAX_TIMER_PERIOD 86400 /* 1 day max */
-static int64_t timer_period = 10 * TIMER_MILLISECOND * 1000; /* default period is 10 seconds */
+extern int64_t timer_period; /* default period is 10 seconds */
 
-static inline double gettime_sec(){
+static inline double gettime_sec(void){
 	struct timeval	tv;
-	gettimeofday(&tv);
+	gettimeofday(&tv, NULL);
 	return tv.tv_sec - tv.tv_usec * 1e-6;
 }
 /* Print out statistics on packets dropped */
@@ -234,7 +209,7 @@ print_stats(void)
 	for (portid = 0; portid < RTE_MAX_ETHPORTS; portid++) {
 		int c;
 		/* skip disabled ports */
-		if ((l2fwd_enabled_port_mask & (1 << portid)) == 0)
+		if ((ups_enabled_port_mask & (1 << portid)) == 0)
 			continue;
 		printf("\nStatistics for port %u ------------------------------"
 			   "\nPackets sent: %24"PRIu64
@@ -271,19 +246,19 @@ print_stats(void)
 static inline void print_mac_addr(unsigned portid){
 		fprintf(stderr, "Port %u, MAC address: %02X:%02X:%02X:%02X:%02X:%02X\n\n",
 				(unsigned) portid,
-				l2fwd_ports_eth_addr[portid].addr_bytes[0],
-				l2fwd_ports_eth_addr[portid].addr_bytes[1],
-				l2fwd_ports_eth_addr[portid].addr_bytes[2],
-				l2fwd_ports_eth_addr[portid].addr_bytes[3],
-				l2fwd_ports_eth_addr[portid].addr_bytes[4],
-				l2fwd_ports_eth_addr[portid].addr_bytes[5]);
+				ups_ports_eth_addr[portid].addr_bytes[0],
+				ups_ports_eth_addr[portid].addr_bytes[1],
+				ups_ports_eth_addr[portid].addr_bytes[2],
+				ups_ports_eth_addr[portid].addr_bytes[3],
+				ups_ports_eth_addr[portid].addr_bytes[4],
+				ups_ports_eth_addr[portid].addr_bytes[5]);
 
 }
 
 
 /* Send the burst of packets on an output interface */
 static int
-l2fwd_send_burst(struct lcore_queue_conf *qconf, unsigned n, uint8_t port)
+ups_send_burst(struct lcore_queue_conf *qconf, unsigned n, uint8_t port)
 {
 	struct rte_mbuf **m_table;
 	unsigned ret;
@@ -310,7 +285,7 @@ l2fwd_send_burst(struct lcore_queue_conf *qconf, unsigned n, uint8_t port)
 
 /* Enqueue packets for TX and prepare them to be sent */
 static int
-l2fwd_send_packet(struct rte_mbuf *m, uint8_t port)
+ups_send_packet(struct rte_mbuf *m, uint8_t port)
 {
 	unsigned lcore_id, len;
 	struct lcore_queue_conf *qconf;
@@ -324,7 +299,7 @@ l2fwd_send_packet(struct rte_mbuf *m, uint8_t port)
 
 	/* enough pkts to be sent */
 	if (unlikely(len == MAX_PKT_BURST)) {
-		l2fwd_send_burst(qconf, MAX_PKT_BURST, port);
+		ups_send_burst(qconf, MAX_PKT_BURST, port);
 		len = 0;
 	}
 
@@ -333,7 +308,7 @@ l2fwd_send_packet(struct rte_mbuf *m, uint8_t port)
 }
 
 static void
-l2fwd_drop_packet(struct rte_mbuf *m)
+ups_drop_packet(struct rte_mbuf *m)
 {
 	rte_pktmbuf_free(m);
 }
@@ -355,7 +330,7 @@ static int arp_input_reply(struct rte_mbuf *m, unsigned portid)
 	unsigned dst_port = portid;
 	eth = rte_pktmbuf_mtod(m, struct ether_hdr *);
 	ether_addr_copy(&eth->s_addr, &eth->d_addr);
-	ether_addr_copy(&l2fwd_ports_eth_addr[dst_port], &eth->s_addr);
+	ether_addr_copy(&ups_ports_eth_addr[dst_port], &eth->s_addr);
 
 	struct arphdr *arph = (struct arphdr *)(rte_pktmbuf_mtod(m, unsigned char*) + sizeof(struct ether_hdr));
 	arph->ar_hrd = htons(arp_hrd_ethernet);
@@ -370,11 +345,11 @@ static int arp_input_reply(struct rte_mbuf *m, unsigned portid)
 	arph->ar_sip = NIC_IP_ADDR;
 
 	ether_addr_copy(&arph->ar_sha, &arph->ar_tha);
-	ether_addr_copy(&l2fwd_ports_eth_addr[dst_port],&arph->ar_sha);
+	ether_addr_copy(&ups_ports_eth_addr[dst_port],&arph->ar_sha);
 
 	//dump_packet(m, 0);
 		
-	l2fwd_send_packet(m, (uint8_t) dst_port);
+	ups_send_packet(m, (uint8_t) dst_port);
 	return 0;
 }
 
@@ -385,7 +360,7 @@ static inline int arp_input(struct rte_mbuf *m, unsigned portid)
 	if(arph->ar_tip == NIC_IP_ADDR)
 		to_me = 1;
 	if(!to_me){
-		l2fwd_drop_packet(m);
+		ups_drop_packet(m);
 		return 0;
 	}
 
@@ -394,7 +369,7 @@ static inline int arp_input(struct rte_mbuf *m, unsigned portid)
 			arp_input_reply(m, portid);
 			break;
 		default:
-			l2fwd_drop_packet(m);
+			ups_drop_packet(m);
 			break;
 	}
 	return 0;
@@ -412,7 +387,7 @@ static inline int eth_output_fast(struct rte_mbuf *m, unsigned portid)
 	m->ol_flags |= PKT_TX_IP_CKSUM;
 #endif
 
-	l2fwd_send_packet(m, portid);
+	ups_send_packet(m, portid);
 	return 0;
 }
 
@@ -472,12 +447,12 @@ static inline int icmp_input(struct rte_mbuf *m, unsigned portid)
 	//DPRINTF("icmp len %d, type %d\n", icmp_len, icmp->type);
 	if(cksum(icmp, icmp_len)){
 		DPRINTF("icmp checksum error\n");
-		l2fwd_drop_packet(m);
+		ups_drop_packet(m);
 		return -EINVAL;
 	}
 	if(icmp->type != ICMP_ECHO || icmp->code != 0){
 		DPRINTF("icmp unsupport error %d, %d\n", icmp->type, icmp->code);
-		l2fwd_drop_packet(m);
+		ups_drop_packet(m);
 		return 0;
 	}
 
@@ -494,6 +469,7 @@ static inline int udp4_input(struct rte_mbuf *m, unsigned portid)
 	int ip_len = ntohs(iph->tot_len);
 	int ip_hdr_len = iph->ihl << 2;
 	int ret;
+	int lcore = rte_lcore_id();
 	struct udphdr *udp = (struct udphdr*)((unsigned char*)iph + ip_hdr_len);
 	struct udp_callback *cb;
 
@@ -503,17 +479,17 @@ static inline int udp4_input(struct rte_mbuf *m, unsigned portid)
 
 	/* TODO udp checksum optional */
 	unsigned short dst_port = ntohs(udp->dest);
-	if (TAILQ_EMPTY(&__sf_ctx->udp_cb_head[dst_port])){
-		l2fwd_drop_packet(m);
+	if (TAILQ_EMPTY(&__sf_ctx->udp_cb_head[lcore][dst_port])){
+		ups_drop_packet(m);
 		goto done;
 	}
 
-	TAILQ_FOREACH(cb, &__sf_ctx->udp_cb_head[dst_port], entries) {
+	TAILQ_FOREACH(cb, &__sf_ctx->udp_cb_head[lcore][dst_port], entries) {
 again:
-		ret = cb->cb(portid, rte_lcore_id(), m, udp);
+		ret = cb->cb(portid, lcore, m, udp, cb->private_data);
 		switch(ret){
 			case SF_DROP:
-				l2fwd_drop_packet(m);
+				ups_drop_packet(m);
 				goto done;
 			case SF_STOLEN:
 				goto done;
@@ -554,7 +530,7 @@ static inline int ip4_input(struct rte_mbuf *m, unsigned portid)
 			break;
 		case IPPROTO_TCP:
 		default:
-			l2fwd_drop_packet(m);
+			ups_drop_packet(m);
 	}
 	return 0;
 }
@@ -572,14 +548,56 @@ static inline void l2dispatch(struct rte_mbuf *m, unsigned portid)
 		arp_input(m, portid);
 	} else {
 		/* drop */
-		l2fwd_drop_packet(m);
+		ups_drop_packet(m);
 	}
 }
 
+static int __ups_forward_udp(unsigned port, unsigned core,
+	struct rte_mbuf *m, struct udphdr *udphdr, void *private)
+{
+	struct client *cl = private;
+	return SF_STOLEN;
+} 
+
+static int ups_bind_udp_port(struct lcore_queue_conf *qconf,
+		struct client *client, unsigned short port)
+{
+	sf_register_udp_callback(rte_lcore_id(), port, 
+			__ups_forward_udp, client);
+	return 0;
+}
+
+static void ups_do_client_cmd(struct lcore_queue_conf *qconf)
+{
+	struct rpc_proto *cmd = NULL;
+	struct client *client = qconf->client;
+	while(rte_ring_dequeue(client->ctl_q, &cmd) == 0){
+		switch(cmd->type){
+			case RPC_PROTO_TYPE_CONN:
+				DPRINTF("Conn from %d\n", client->client_id);
+				break;
+			case RPC_PROTO_TYPE_DISCONN:
+				DPRINTF("Disconn from %d\n", client->client_id);
+				break;
+			case RPC_PROTO_TYPE_BIND:
+				DPRINTF("bind from %d, proto %d, port %d\n", client->client_id, cmd->protocol, ntohs(cmd->addr.sin_port));
+				if(cmd->protocol == SOCK_DGRAM){
+					ups_bind_udp_port(qconf, client, ntohs(cmd->addr.sin_port));
+				}else{
+					DPRINTF("bind fail\n");
+				}
+				break;
+			default:
+				DPRINTF("unknown cmd %d\n", cmd->type);
+		}
+		DPRINTF("XXX %d\n",rte_ring_count(client->ctl_q));
+		rte_mempool_put(ups_ctl_pool, cmd);
+	}
+}
 
 /* main processing loop */
 	static void
-l2fwd_main_loop(void)
+ups_main_loop(void)
 {
 	struct rte_mbuf *pkts_burst[MAX_PKT_BURST];
 	unsigned lcore_id, portid;
@@ -607,7 +625,10 @@ l2fwd_main_loop(void)
 				portid);
 	}
 
+	assert(qconf->client != NULL);
+
 	while (1) {
+		ups_do_client_cmd(qconf);
 
 		cur_tsc = rte_rdtsc();
 
@@ -620,7 +641,7 @@ l2fwd_main_loop(void)
 			for (portid = 0; portid < RTE_MAX_ETHPORTS; portid++) {
 				if (qconf->tx_mbufs[portid].len == 0)
 					continue;
-				l2fwd_send_burst(&lcore_queue_conf[lcore_id],
+				ups_send_burst(&lcore_queue_conf[lcore_id],
 						qconf->tx_mbufs[portid].len,
 						(uint8_t) portid);
 				qconf->tx_mbufs[portid].len = 0;
@@ -684,140 +705,12 @@ l2fwd_main_loop(void)
 }
 
 	static int
-l2fwd_launch_one_lcore(__attribute__((unused)) void *dummy)
+ups_launch_one_lcore(__attribute__((unused)) void *dummy)
 {
-	l2fwd_main_loop();
+	ups_main_loop();
 	return 0;
 }
 
-/* display usage */
-	static void
-l2fwd_usage(const char *prgname)
-{
-	printf("%s [EAL options] -- -p PORTMASK [-q NQ]\n"
-			"  -p PORTMASK: hexadecimal bitmask of ports to configure\n"
-			"  -q NQ: number of queue (=ports) per lcore (default is 1)\n"
-			"  -T PERIOD: statistics will be refreshed each PERIOD seconds (0 to disable, 10 default, 86400 maximum)\n",
-			prgname);
-}
-
-	static int
-l2fwd_parse_portmask(const char *portmask)
-{
-	char *end = NULL;
-	unsigned long pm;
-
-	/* parse hexadecimal string */
-	pm = strtoul(portmask, &end, 16);
-	if ((portmask[0] == '\0') || (end == NULL) || (*end != '\0'))
-		return -1;
-
-	if (pm == 0)
-		return -1;
-
-	return pm;
-}
-
-	static unsigned int
-l2fwd_parse_nqueue(const char *q_arg)
-{
-	char *end = NULL;
-	unsigned long n;
-
-	/* parse hexadecimal string */
-	n = strtoul(q_arg, &end, 10);
-	if ((q_arg[0] == '\0') || (end == NULL) || (*end != '\0'))
-		return 0;
-	if (n == 0)
-		return 0;
-	if (n >= MAX_RX_QUEUE_PER_LCORE)
-		return 0;
-
-	return n;
-}
-
-	static int
-l2fwd_parse_timer_period(const char *q_arg)
-{
-	char *end = NULL;
-	int n;
-
-	/* parse number string */
-	n = strtol(q_arg, &end, 10);
-	if ((q_arg[0] == '\0') || (end == NULL) || (*end != '\0'))
-		return -1;
-	if (n >= MAX_TIMER_PERIOD)
-		return -1;
-
-	return n;
-}
-
-/* Parse the argument given in the command line of the application */
-	static int
-l2fwd_parse_args(int argc, char **argv)
-{
-	int opt, ret;
-	char **argvopt;
-	int option_index;
-	char *prgname = argv[0];
-	static struct option lgopts[] = {
-		{NULL, 0, 0, 0}
-	};
-
-	argvopt = argv;
-
-	while ((opt = getopt_long(argc, argvopt, "p:q:T:",
-					lgopts, &option_index)) != EOF) {
-
-		switch (opt) {
-			/* portmask */
-			case 'p':
-				l2fwd_enabled_port_mask = l2fwd_parse_portmask(optarg);
-				if (l2fwd_enabled_port_mask == 0) {
-					printf("invalid portmask\n");
-					l2fwd_usage(prgname);
-					return -1;
-				}
-				break;
-
-				/* nqueue */
-			case 'q':
-				l2fwd_rx_queue_per_lcore = l2fwd_parse_nqueue(optarg);
-				if (l2fwd_rx_queue_per_lcore == 0) {
-					printf("invalid queue number\n");
-					l2fwd_usage(prgname);
-					return -1;
-				}
-				break;
-
-				/* timer period */
-			case 'T':
-				timer_period = l2fwd_parse_timer_period(optarg) * 1000 * TIMER_MILLISECOND;
-				if (timer_period < 0) {
-					printf("invalid timer period\n");
-					l2fwd_usage(prgname);
-					return -1;
-				}
-				break;
-
-				/* long options */
-			case 0:
-				l2fwd_usage(prgname);
-				return -1;
-
-			default:
-				l2fwd_usage(prgname);
-				return -1;
-		}
-	}
-
-	if (optind >= 0)
-		argv[optind-1] = prgname;
-
-	ret = optind-1;
-	optind = 0; /* reset getopt lib */
-	return ret;
-}
 
 /* Check the link status of all ports in up to 9s, and print them finally */
 	static void
@@ -874,6 +767,55 @@ check_all_ports_link_status(uint8_t port_num, uint32_t port_mask)
 	}
 }
 
+/**
+ * Set up the DPDK rings which will be used to pass packets, via
+ * pointers, between the multi-process server and client processes.
+ * Each client needs one RX queue.
+ */
+static int
+init_shm_rings(void)
+{
+	unsigned i;
+	unsigned socket_id;
+	const char * q_name;
+	const unsigned ringsize = CLIENT_QUEUE_RINGSIZE;
+
+	clients = rte_malloc("client details",
+		sizeof(*clients) * num_clients, 0);
+	if (clients == NULL)
+		rte_exit(EXIT_FAILURE, "Cannot allocate memory for client program details\n");
+
+	for (i = 0; i < num_clients; i++) {
+		/* Create an RX queue for each client */
+		/* numa */
+		socket_id = rte_socket_id();
+		q_name = get_rx_queue_name(i);
+		clients[i].rx_q = rte_ring_create(q_name,
+				ringsize, socket_id,
+				RING_F_SP_ENQ | RING_F_SC_DEQ ); /* single prod, single cons */
+		if (clients[i].rx_q == NULL)
+			rte_exit(EXIT_FAILURE, "Cannot create rx ring queue for client %u\n", i);
+		q_name = get_tx_queue_name(i);
+		clients[i].tx_q = rte_ring_create(q_name,
+				ringsize, socket_id,
+				RING_F_SP_ENQ | RING_F_SC_DEQ ); /* single prod, single cons */
+		if (clients[i].tx_q == NULL)
+			rte_exit(EXIT_FAILURE, "Cannot create tx ring queue for client %u\n", i);
+		q_name = get_ctl_queue_name(i);
+		clients[i].ctl_q = rte_ring_create(q_name,
+				ringsize, socket_id,
+				RING_F_SP_ENQ | RING_F_SC_DEQ ); /* single prod, single cons */
+		clients[i].client_id = i;
+	}
+
+	/* XXX dynamic client binding */
+	assert(MAX_CLIENTS >= RTE_MAX_LCORE);
+	for(i = 0; i < RTE_MAX_LCORE; i++){
+		lcore_queue_conf[i].client = &clients[i];
+	}
+	return 0;
+}
+
 static int
 nic_main(int argc, char **argv)
 {
@@ -895,19 +837,25 @@ nic_main(int argc, char **argv)
 
 	nb_lcores = rte_lcore_count();
 	/* parse application arguments (after the EAL ones) */
-	ret = l2fwd_parse_args(argc, argv);
+	ret = ups_parse_args(argc, argv);
 	if (ret < 0)
 		rte_exit(EXIT_FAILURE, "Invalid L2FWD arguments\n");
 
 	/* create the mbuf pool */
-	l2fwd_pktmbuf_pool =
-		rte_mempool_create("mbuf_pool", NB_MBUF,
+	ups_pktmbuf_pool =
+		rte_mempool_create(PKTMBUF_POOL_NAME, NB_MBUF,
 				MBUF_SIZE, 32,
 				sizeof(struct rte_pktmbuf_pool_private),
 				rte_pktmbuf_pool_init, NULL,
 				rte_pktmbuf_init, NULL,
 				rte_socket_id(), 0);
-	if (l2fwd_pktmbuf_pool == NULL)
+	ups_ctl_pool = rte_mempool_create(MP_CONTROL_POOL_NAME,
+			NB_CONTROLBUF,
+			sizeof(struct rpc_proto), 32, 0,
+			NULL, NULL,
+			NULL, NULL,
+			rte_socket_id(), 0);
+	if (ups_pktmbuf_pool == NULL)
 		rte_exit(EXIT_FAILURE, "Cannot init mbuf pool\n");
 
 	/* init driver(s) */
@@ -924,9 +872,9 @@ nic_main(int argc, char **argv)
 	if (nb_ports > RTE_MAX_ETHPORTS)
 		nb_ports = RTE_MAX_ETHPORTS;
 
-	/* reset l2fwd_dst_ports */
+	/* reset ups_dst_ports */
 	for (portid = 0; portid < RTE_MAX_ETHPORTS; portid++)
-		l2fwd_dst_ports[portid] = 0;
+		ups_dst_ports[portid] = 0;
 	last_port = 0;
 
 	/*
@@ -934,12 +882,12 @@ nic_main(int argc, char **argv)
 	 */
 	for (portid = 0; portid < nb_ports; portid++) {
 		/* skip ports that are not enabled */
-		if ((l2fwd_enabled_port_mask & (1 << portid)) == 0)
+		if ((ups_enabled_port_mask & (1 << portid)) == 0)
 			continue;
 
 		if (nb_ports_in_mask % 2) {
-			l2fwd_dst_ports[portid] = last_port;
-			l2fwd_dst_ports[last_port] = portid;
+			ups_dst_ports[portid] = last_port;
+			ups_dst_ports[last_port] = portid;
 		}
 		else
 			last_port = portid;
@@ -950,7 +898,7 @@ nic_main(int argc, char **argv)
 	}
 	if (nb_ports_in_mask % 2) {
 		printf("Notice: odd number of ports in portmask.\n");
-		l2fwd_dst_ports[last_port] = last_port;
+		ups_dst_ports[last_port] = last_port;
 	}
 
 	qconf = NULL;
@@ -964,7 +912,7 @@ nic_main(int argc, char **argv)
 	for (portid = 0; portid < nb_ports; portid++) {
 		unsigned int queueid = 0;
 		/* skip ports that are not enabled */
-		if ((l2fwd_enabled_port_mask & (1 << portid)) == 0) {
+		if ((ups_enabled_port_mask & (1 << portid)) == 0) {
 			printf("Skipping disabled port %u\n", (unsigned) portid);
 			nb_ports_available--;
 			continue;
@@ -980,14 +928,14 @@ nic_main(int argc, char **argv)
 			rte_exit(EXIT_FAILURE, "Cannot configure device: err=%d, port=%u\n",
 					ret, (unsigned) portid);
 
-		rte_eth_macaddr_get(portid,&l2fwd_ports_eth_addr[portid]);
+		rte_eth_macaddr_get(portid,&ups_ports_eth_addr[portid]);
 
 		/* init one RX queue */
 		fflush(stdout);
 		for(queueid = 0; queueid < nb_lcores; queueid++) {
 			ret = rte_eth_rx_queue_setup(portid, queueid, nb_rxd,
 					rte_eth_dev_socket_id(portid), &rx_conf,
-					l2fwd_pktmbuf_pool);
+					ups_pktmbuf_pool);
 			if (ret < 0)
 				rte_exit(EXIT_FAILURE, "rte_eth_rx_queue_setup:err=%d, port=%u\n",
 						ret, (unsigned) portid);
@@ -1029,30 +977,28 @@ nic_main(int argc, char **argv)
 	unsigned int i, rx_lcore_id = 0;
 	/* Initialize the port/queue configuration of each logical core */
 	portid = first_portid;
-	for (i = 0; i < nb_lcores; i++) {
+	for (i = 0; i < RTE_MAX_LCORE; i++) {
 		/* get the lcore_id for this port */
-		while (rte_lcore_is_enabled(i) == 0) {
-			rx_lcore_id++;
-			if (rx_lcore_id >= RTE_MAX_LCORE)
-				rte_exit(EXIT_FAILURE, "Not enough cores\n");
-		}
-		DPRINTF("core %d\n", rx_lcore_id);
+		if(!rte_lcore_is_enabled(i))
+			continue;
+		DPRINTF("core %d -> queue %d\n", i, rx_lcore_id);
 
-		qconf = &lcore_queue_conf[rx_lcore_id];
+		qconf = &lcore_queue_conf[i];
 
 		qconf->rx_port_list[qconf->n_rx_port] = portid;
 		qconf->n_rx_port++;
-		qconf->queue_id = i;
+		qconf->queue_id = rx_lcore_id;
 		qconf->ip_id_step = rte_lcore_count();
-		qconf->next_ip_id = i;
-		printf("Lcore %u: RX port %u\n", rx_lcore_id, (unsigned) portid);
+		qconf->next_ip_id = rx_lcore_id;
+		printf("Lcore %u: RX port %u\n", i, (unsigned) portid);
 		rx_lcore_id++;
 	}
 
-	check_all_ports_link_status(nb_ports, l2fwd_enabled_port_mask);
+	check_all_ports_link_status(nb_ports, ups_enabled_port_mask);
+	init_shm_rings();
 
 	/* launch per-lcore init on every lcore */
-	rte_eal_mp_remote_launch(l2fwd_launch_one_lcore, NULL, CALL_MASTER);
+	rte_eal_mp_remote_launch(ups_launch_one_lcore, NULL, CALL_MASTER);
 	RTE_LCORE_FOREACH_SLAVE(lcore_id) {
 		if (rte_eal_wait_lcore(lcore_id) < 0)
 			return -1;
@@ -1067,9 +1013,11 @@ struct streamfilter_ctx *sf_init_context(void)
 	if(__sf_ctx)
 		return __sf_ctx;
 	struct streamfilter_ctx *ctx = malloc(sizeof(struct streamfilter_ctx));
-	int i;
-	for(i=0; i < MAX_UDP_PORTS+1; i++){
-		TAILQ_INIT(&ctx->udp_cb_head[i]);
+	int i, c;
+	for(c = 0; c < MAX_NUM_CORE; c++) {
+		for(i=0; i < MAX_UDP_PORTS+1; i++) {
+			TAILQ_INIT(&ctx->udp_cb_head[c][i]);
+		}
 	}
 	__sf_ctx = ctx;
 	return ctx;
@@ -1081,19 +1029,22 @@ void sf_destroy_context(void)
 	free(__sf_ctx);
 }
 
-int sf_register_udp_callback(unsigned port, udp_callback_fn fn, void *data)
+int sf_register_udp_callback(int cpu, unsigned port, udp_callback_fn fn, void *data)
 {
 	if(port > MAX_UDP_PORTS)
+		return -EINVAL;
+	if(cpu > MAX_NUM_CORE)
 		return -EINVAL;
 	struct udp_callback *cb = malloc(sizeof(struct udp_callback));
 	cb->cb = fn;
 	cb->private_data = data;
-	TAILQ_INSERT_TAIL(&__sf_ctx->udp_cb_head[port], cb, entries);
+	TAILQ_INSERT_TAIL(&__sf_ctx->udp_cb_head[cpu][port], cb, entries);
+	DPRINTF("Reg udp core %d, port %d\n", cpu, port);
 	return 0;
 }
 
 static int udp_callback_echo(unsigned port, unsigned core,
-	struct rte_mbuf *m, struct udphdr *udphdr)
+	struct rte_mbuf *m, struct udphdr *udphdr, void *p)
 {
 	(void)core;
 	udp4_output_fast(m, udphdr, port);
@@ -1102,9 +1053,11 @@ static int udp_callback_echo(unsigned port, unsigned core,
 
 int main(int argc, char **argv)
 {
+	int c;
 	sf_init_context();
 
-	sf_register_udp_callback(5555, udp_callback_echo, NULL);
+	for(c = 0; c < MAX_NUM_CORE; c++)
+		sf_register_udp_callback(c, 5555, udp_callback_echo, NULL);
 
 	int ret = nic_main(argc, argv);
 

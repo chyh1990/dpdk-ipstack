@@ -80,4 +80,5 @@ static inline void ether_swap_mac(struct ether_hdr *hdr){
 	ether_addr_copy(&t, &hdr->d_addr);
 }
 
+int ups_parse_args(int argc, char **argv);
 #endif

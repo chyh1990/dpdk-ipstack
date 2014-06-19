@@ -41,6 +41,8 @@
 #include <linux/ip.h>
 #include <linux/udp.h>
 
+#include "config.h"
+
 #ifdef RTE_EXEC_ENV_BAREMETAL
 #define MAIN _main
 #else
@@ -58,22 +60,23 @@ int MAIN(int argc, char **argv);
 #define SF_REPEAT 4
 
 typedef int (*udp_callback_fn)(unsigned port, unsigned core,
-	struct rte_mbuf *m, struct udphdr *udphdr);
+	struct rte_mbuf *m, struct udphdr *udphdr, void*);
 
+#define __SF_ALIGN_CACHE __attribute__((aligned(64)))
 struct udp_callback{
 	TAILQ_ENTRY(udp_callback) entries;
 	udp_callback_fn cb;
 	void *private_data;
-};
+} __SF_ALIGN_CACHE;
 
 struct streamfilter_ctx{
-	TAILQ_HEAD(_udp_cb_head, udp_callback) udp_cb_head[MAX_UDP_PORTS+1];
+	TAILQ_HEAD(_udp_cb_head, udp_callback) udp_cb_head[MAX_NUM_CORE][MAX_UDP_PORTS+1];
 };
 
 struct streamfilter_ctx *sf_init_context(void);
 void sf_destroy_context(void);
 
-int sf_register_udp_callback(unsigned port, udp_callback_fn fn, void *data);
+int sf_register_udp_callback(int cpu, unsigned port, udp_callback_fn fn, void *data);
 
 /* global ctx
  * Assume immutable in mainloop
