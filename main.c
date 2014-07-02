@@ -552,12 +552,43 @@ static inline void l2dispatch(struct rte_mbuf *m, unsigned portid)
 	}
 }
 
+#if 0
 static int __ups_forward_udp(unsigned port, unsigned core,
 	struct rte_mbuf *m, struct udphdr *udphdr, void *private)
 {
 	struct client *cl = private;
+	if (rte_ring_enqueue_bulk(cl->rx_q, (void **)cl_rx_buf[client].buffer,
+				cl_rx_buf[client].count) != 0){
+		for (j = 0; j < cl_rx_buf[client].count; j++)
+			rte_pktmbuf_free(cl_rx_buf[client].buffer[j]);
+		cl->stats.rx_drop += cl_rx_buf[client].count;
+	}else{
+		cl->stats.rx += cl_rx_buf[client].count;
+	}
 	return SF_STOLEN;
 } 
+
+static inline void
+__ups_udp_enqueue_rx_packet(struct client *cl, struct rte_mbuf *buf)
+{
+	cl_rx_buf[client].buffer[cl_rx_buf[client].count++] = buf;
+}
+#endif
+
+static int __ups_forward_udp(unsigned port, unsigned core,
+	struct rte_mbuf *m, struct udphdr *udphdr, void *private)
+{
+	struct client *cl = private;
+	uint16_t hlen = (uint16_t)((char*)udphdr - (char*)m);
+	rte_pktmbuf_adj(m, hlen);
+	if (rte_ring_enqueue(cl->rx_q, m)) {
+		rte_pktmbuf_free(m);
+		cl->stats.rx_drop ++;
+	} else {
+		cl->stats.rx ++;
+	}
+	return SF_STOLEN; 
+}
 
 static int ups_bind_udp_port(struct lcore_queue_conf *qconf,
 		struct client *client, unsigned short port)

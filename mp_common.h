@@ -51,6 +51,11 @@ get_ctl_queue_name(unsigned id)
 	return buffer;
 }
 
+struct channel{
+	struct rte_ring *rx_q;
+	struct rte_ring *tx_q;
+};
+
 struct client {
 	struct rte_ring *rx_q;
 	struct rte_ring *tx_q;

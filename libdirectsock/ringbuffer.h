@@ -70,8 +70,7 @@
   (BUF)->end = ((BUF)->end + 1) % (BUF)->size; \
   if (isBufferEmpty(BUF)) { \
     (BUF)->start = nextStartIndex(BUF); \
-  } \
-	while(0)
+  }} while(0)
 
 #define bufferRead(BUF, ELEM) do{\
     ELEM = (BUF)->elems[(BUF)->start]; \

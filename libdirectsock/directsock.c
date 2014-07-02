@@ -38,6 +38,8 @@
 #include <rte_ethdev.h>
 #include <rte_string_fns.h>
 
+#include <linux/udp.h>
+
 #include "directsock.h"
 #include "ringbuffer.h"
 #include "../mp_common.h"
@@ -285,13 +287,11 @@ int socket(int domain, int type, int protocol)
 int bind(int sockfd, const struct sockaddr *addr,
 		                socklen_t addrlen)
 {
-	if(!is_dsocket(sockfd)){
+	if(!is_dsocket(sockfd))
 		return real_bind(sockfd, addr, addrlen);
-	}
 
-	if(!addr){
+	if(!addr)
 		goto err;
-	}
 
 	if(addrlen > sizeof(struct sockaddr_in))
 		goto err;
@@ -299,10 +299,14 @@ int bind(int sockfd, const struct sockaddr *addr,
 	struct dsocket *s = lookup_dsocket(0, sockfd);
 	if(!s)
 		goto err;
+	unsigned short port = ntohs(s->addr.sin_port);
+	if(!port2sock[port])
+		return -EBUSY;
 	memcpy(&s->addr, addr, addrlen);
 	//TODO
 	ds_send_rpc_bind(s);
-	DPRINTF("sock %d, bind port %d\n", s->fd, ntohs(s->addr.sin_port));
+	port2sock[port] = s;
+	DPRINTF("sock %d, bind port %d\n", s->fd, port);
 	return 0;
 err:
 	errno = EINVAL;
@@ -311,6 +315,18 @@ err:
 
 static int __poll_fd(void)
 {
+	struct rte_mbuf *m = NULL;
+	while(1){
+		if (rte_ring_dequeue(rx_ring, &m)) {
+			struct udphdr *hdr = rte_pktmbuf_mtod(m, struct udphdr*);
+			uint16_t port = ntohs(hdr->dest);
+			struct dsocket *s = port2sock[port];
+			if(!s)
+				rte_pktmbuf_free(m);
+			bufferWrite(&s->rx_queue, m);
+			break;
+		}
+	}
 }
 
 ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
@@ -326,6 +342,9 @@ ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
 		if(flags & MSG_DONTWAIT)
 			return -EAGAIN;
 		//polling
+		do{
+			__poll_fd();
+		}while(isBufferEmpty(&s->rx_queue));
 	}
 	bufferRead(&s->rx_queue, m);
 	return 0;
