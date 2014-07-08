@@ -575,11 +575,12 @@ __ups_udp_enqueue_rx_packet(struct client *cl, struct rte_mbuf *buf)
 }
 #endif
 
-static int __ups_forward_udp(unsigned port, unsigned core,
+static int __ups_forward_udp(unsigned portid, unsigned core,
 	struct rte_mbuf *m, struct udphdr *udphdr, void *private)
 {
 	struct client *cl = private;
-	uint16_t hlen = (uint16_t)((char*)udphdr - (char*)m);
+	uint16_t hlen = (uint16_t)((char*)udphdr - rte_pktmbuf_mtod(m, char*));
+	//DPRINTF("XXhlen %d\n", (int)hlen);
 	rte_pktmbuf_adj(m, hlen);
 	if (rte_ring_enqueue(cl->rx_q, m)) {
 		rte_pktmbuf_free(m);
@@ -626,6 +627,14 @@ static void ups_do_client_cmd(struct lcore_queue_conf *qconf)
 	}
 }
 
+static void ups_do_tx_ring(struct lcore_queue_conf *qconf)
+{
+	struct rte_mbuf m* = NULL;
+	struct client *client = qconf->client;
+	while(rte_ring_dequeue(client->tx_q, &m) == 0){
+	}
+}
+
 /* main processing loop */
 	static void
 ups_main_loop(void)
@@ -660,6 +669,7 @@ ups_main_loop(void)
 
 	while (1) {
 		ups_do_client_cmd(qconf);
+		ups_do_tx_ring(qconf);
 
 		cur_tsc = rte_rdtsc();
 

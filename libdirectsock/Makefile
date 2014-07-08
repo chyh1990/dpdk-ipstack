@@ -17,8 +17,8 @@ CFLAGS += -O3
 CFLAGS += $(WERROR_FLAGS)
 LDFLAGS +=-z defs
 LDLIBS += -lrte_pmd_virtio_uio -lrte_pmd_vmxnet3_uio -lrte_pmd_ixgbe -lrte_pmd_e1000 -lrte_timer -lrte_hash \
-	  -lm -lrt -lrte_mbuf -lethdev \
+	  -lrte_mbuf -lethdev \
 	  -lrte_eal -lrte_mempool -lrte_ring -lrte_pmd_ring -lrte_malloc
-LDLIBS+=-ldl -lpthread
+LDLIBS+=-lm -lrt -ldl -lpthread
 
 include $(RTE_SDK)/mk/rte.extshared.mk

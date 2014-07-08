@@ -83,6 +83,7 @@ struct rpc_proto{
 #define RPC_PROTO_TYPE_CONN 1
 #define RPC_PROTO_TYPE_DISCONN 2
 #define RPC_PROTO_TYPE_BIND 3
+#define RPC_PROTO_TYPE_SEND 4
 
 #define CLIENT_QUEUE_RINGSIZE 128
 

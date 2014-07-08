@@ -44,6 +44,8 @@
 #include "ringbuffer.h"
 #include "../mp_common.h"
 
+#define MIN(x,y) ((x)<(y)?(x):(y))
+
 #define DSOCKET_ERR(msg, ...) \
 do {\
 	fprintf(stderr, "directsocket Library:" msg, ##__VA_ARGS__); exit(1);\
@@ -173,6 +175,8 @@ static int (*real_socket)(int, int, int) = NULL;
 static int (*real_bind)(int, const struct sockaddr*, socklen_t) = NULL;
 static ssize_t (*real_recvfrom)(int , void *, size_t, int,
 		struct sockaddr *, socklen_t *);
+static ssize_t (*real_sendto)(int sockfd, const void *buf, size_t len, int flags,
+                const struct sockaddr *dest_addr, socklen_t addrlen);
 
 static inline void ds_send_rpc_conn(int conn)
 {
@@ -258,6 +262,7 @@ void directsock_init(void)
 	real_socket = dlsym(RTLD_NEXT, "socket");
 	real_bind = dlsym(RTLD_NEXT, "bind");
 	real_recvfrom = dlsym(RTLD_NEXT, "recvfrom");
+	real_sendto = dlsym(RTLD_NEXT, "sendto");
 
 	ds_send_rpc_conn(1);
 	DPRINTF("init done\n");
@@ -299,14 +304,16 @@ int bind(int sockfd, const struct sockaddr *addr,
 	struct dsocket *s = lookup_dsocket(0, sockfd);
 	if(!s)
 		goto err;
-	unsigned short port = ntohs(s->addr.sin_port);
-	if(!port2sock[port])
+	unsigned short port = ntohs(((struct sockaddr_in*)addr)->sin_port);
+	if(port2sock[port]){
+		errno = EBUSY;
 		return -EBUSY;
+	}
 	memcpy(&s->addr, addr, addrlen);
 	//TODO
 	ds_send_rpc_bind(s);
 	port2sock[port] = s;
-	DPRINTF("sock %d, bind port %d\n", s->fd, port);
+	DPRINTF("sock %d, bind port %d\n", s->fd, (int)port);
 	return 0;
 err:
 	errno = EINVAL;
@@ -317,16 +324,23 @@ static int __poll_fd(void)
 {
 	struct rte_mbuf *m = NULL;
 	while(1){
-		if (rte_ring_dequeue(rx_ring, &m)) {
+		if (rte_ring_dequeue(rx_ring, &m) == 0) {
 			struct udphdr *hdr = rte_pktmbuf_mtod(m, struct udphdr*);
 			uint16_t port = ntohs(hdr->dest);
 			struct dsocket *s = port2sock[port];
-			if(!s)
+			DPRINTF("XXX %d %p\n", (int)port, s);
+			if(!s){
 				rte_pktmbuf_free(m);
-			bufferWrite(&s->rx_queue, m);
+				continue;
+			}
+			if(!isBufferFull(&s->rx_queue))
+				bufferWrite(&s->rx_queue, m);
+			else
+				rte_pktmbuf_free(m);
 			break;
 		}
 	}
+	return 0;
 }
 
 ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
@@ -338,6 +352,7 @@ ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
 	struct rte_mbuf *m = NULL;
 	if(!s)
 		goto err;
+	DPRINTF("wait recv from %d\n", sockfd);
 	if(isBufferEmpty(&s->rx_queue)){
 		if(flags & MSG_DONTWAIT)
 			return -EAGAIN;
@@ -346,11 +361,55 @@ ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
 			__poll_fd();
 		}while(isBufferEmpty(&s->rx_queue));
 	}
+	DPRINTF("recv from %d\n", sockfd);
 	bufferRead(&s->rx_queue, m);
-	return 0;
+	struct udphdr *p = rte_pktmbuf_mtod(m, void*);
+	size_t rlen = MIN(p->len, len);
+	/* have to copy */
+	memcpy(buf, p+1, rlen);
+	rte_pktmbuf_free(m);
+	//XXX src_addr
+	return len;
 err:
 	errno = EINVAL;
 	return -EINVAL;
 }
 
+ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
+		                      const struct sockaddr *dest_addr, socklen_t addrlen)
+{
+	if(!is_dsocket(sockfd))
+		return real_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
+
+	struct dsocket *s = lookup_dsocket(0, sockfd);
+	if(!s)
+		goto err;
+	struct rte_mbuf *m = rte_pktmbuf_alloc(mpool);
+	if(!m)
+		goto nomem;
+	
+	rte_pktmbuf_append(m, sizeof(struct rpc_proto));
+	struct rpc_proto *hdr = rte_pktmbuf_mtod(m, struct rpc_proto*);
+	hdr->protocol = SOCK_DGRAM;
+	hdr->type = RPC_PROTO_TYPE_SEND;
+	memcpy(&hdr->addr, dest_addr, addrlen);
+
+	unsigned char *data = (unsigned char*)rte_pktmbuf_append(m, len);
+	if(!data){
+		rte_pktmbuf_free(m);
+		goto nomem;
+	}
+	memcpy(data, buf, len);
+	if (rte_ring_enqueue(tx_ring, &m)) {
+		rte_pktmbuf_free(m);
+		goto nomem;
+	}
+
+err:
+	errno = EINVAL;
+	return -EINVAL;
+nomem:
+	errno = ENOMEM;
+	return -ENOMEM;
+}
 
